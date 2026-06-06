@@ -65,6 +65,10 @@ try:
     from .bilibili_favsub import BilibiliFavSubscriptionManager
 except ImportError:
     from bilibili_favsub import BilibiliFavSubscriptionManager
+try:
+    from .x_favorites_subscription import XFavoritesSubscriptionManager
+except ImportError:
+    from x_favorites_subscription import XFavoritesSubscriptionManager
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -10363,6 +10367,27 @@ class VideoDownloader:
             cookies_path=self.x_cookies_path
         )
 
+    async def _download_x_favorite_item(self, url: str, download_path: Path) -> Dict[str, Any]:
+        """
+        下载单个 X 红心内容（视频或图片）
+        供 X 收藏订阅管理器调用
+
+        Args:
+            url: X 内容 URL
+            download_path: 下载目录
+
+        Returns:
+            下载结果字典
+        """
+        try:
+            # 判断是视频还是图片，调用相应的下载函数
+            # 这里复用现有下载逻辑，但不需要 Telegram 消息更新
+            result = await self._download_x(url)
+            return result
+        except Exception as e:
+            logger.error(f"🎯 下载 X 红心内容失败 {url}: {e}")
+            return {"success": False, "error": str(e)}
+
 
 
     async def _download_x_playlist(self, url: str, download_path: Path, message_updater=None, playlist_info: dict = None) -> Dict[str, Any]:
@@ -14326,6 +14351,21 @@ class TelegramBot:
             logger.warning(f"⚠️ 初始化 B站收藏夹订阅管理器失败: {e}")
             # self.fav_manager 已经是 None
 
+        # X 红心收藏订阅管理器 - 确保属性始终存在
+        self.x_fav_manager = None  # 先设置默认值
+        try:
+            self.x_fav_manager = XFavoritesSubscriptionManager(
+                download_path=self.downloader.download_path,
+                proxy_host=self.downloader.proxy_host,
+                cookies_path=self.downloader.x_cookies_path
+            )
+            # 设置下载回调
+            self.x_fav_manager.download_callback = self._download_x_favorite_item
+            logger.info("✅ X 红心收藏订阅管理器初始化成功")
+        except Exception as e:
+            logger.warning(f"⚠️ 初始化 X 红心收藏订阅管理器失败: {e}")
+            # self.x_fav_manager 已经是 None
+
         # qBittorrent 配置 - 优先从TOML配置文件读取，回退到环境变量
         self.qb_config = {
             "host": None,
@@ -15015,6 +15055,7 @@ class TelegramBot:
         # # 已删除：sxt命令处理器
         self.application.add_handler(CommandHandler("settings", self.settings_command))
         self.application.add_handler(CommandHandler("favsub", self.favsub_command))
+        self.application.add_handler(CommandHandler("xfav", self.xfav_command))
         self.application.add_handler(CommandHandler("cancel", self.cancel_command))
         self.application.add_handler(CommandHandler("cleanup", self.cleanup_command))
         self.application.add_handler(
@@ -16085,6 +16126,151 @@ class TelegramBot:
 
         except Exception as e:
             logger.error(f"favsub命令处理失败: {e}")
+            await update.message.reply_text(f"❌ 命令处理失败: {e}")
+
+    async def xfav_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /xfav 命令 - 订阅 X 红心收藏"""
+        user_id = update.message.from_user.id
+
+        # 权限检查
+        if not self._check_user_permission(user_id):
+            await update.message.reply_text("❌ 您没有权限使用此功能")
+            return
+
+        # 检查管理器是否初始化
+        if not self.x_fav_manager:
+            await update.message.reply_text("❌ X 红心收藏订阅管理器未初始化")
+            return
+
+        try:
+            # 获取命令参数
+            args = context.args
+            if not args:
+                poll_interval = self.x_fav_manager.poll_interval if self.x_fav_manager else 60
+                help_text = f"""
+🎯 <b>X 红心收藏订阅功能</b>
+
+<b>使用方法：</b>
+<code>/xfav add</code> - 添加订阅
+<code>/xfav remove</code> - 取消订阅
+<code>/xfav check</code> - 手动触发检查
+<code>/xfav status</code> - 查看订阅状态
+
+<b>说明：</b>
+• 需要先配置 X cookies
+• 订阅后会每{poll_interval}分钟自动检查并下载新的红心内容
+• 内容将保存到 X/Likes 目录
+                """
+                await update.message.reply_text(help_text, parse_mode="HTML")
+                return
+
+            command = args[0].lower()
+
+            if command == "status":
+                # 查看订阅任务状态
+                subscriptions = self.x_fav_manager.get_subscriptions_list()
+                task_running = self.x_fav_manager.is_check_task_running()
+
+                status_text = f"""
+📊 <b>X 红心收藏订阅状态</b>
+
+🔧 <b>配置信息：</b>
+• 检查间隔: {self.x_fav_manager.poll_interval} 分钟
+• 下载目录: {self.x_fav_manager.likes_download_path}
+• 代理设置: {'已配置' if self.x_fav_manager.proxy_host else '未配置'}
+• Cookies: {'已配置' if self.x_fav_manager.cookies_path and os.path.exists(self.x_fav_manager.cookies_path) else '未配置'}
+
+📚 <b>订阅统计：</b>
+• 后台任务: {'🟢 运行中' if task_running else '🔴 已停止'}
+"""
+
+                if subscriptions:
+                    for sub_info in subscriptions:
+                        import time
+                        added_time = sub_info.get('added_time', 0)
+                        last_check = sub_info.get('last_check', 0)
+                        added_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(added_time))
+                        if last_check > 0:
+                            last_check_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(last_check))
+                        else:
+                            last_check_str = "未检查"
+
+                        status_text += f"""
+🎯 <b>订阅信息</b>
+• 订阅时间: {added_str}
+• 最后检查: {last_check_str}
+• 内容总数: {sub_info.get('last_item_count', 0)}
+• 已下载: {sub_info.get('download_count', 0)}
+"""
+                else:
+                    status_text += "\n暂无订阅\n"
+
+                status_text += f"\n💡 使用 <code>/xfav add</code> 添加订阅"
+
+                await update.message.reply_text(status_text, parse_mode="HTML")
+
+            elif command == "add":
+                # 添加订阅
+                status_msg = await update.message.reply_text("🔍 正在验证账号...")
+
+                result = await self.x_fav_manager.add_subscription()
+
+                if result["success"]:
+                    success_text = f"""
+✅ <b>订阅成功！</b>
+
+🎯 <b>X 红心收藏已订阅</b>
+{result.get('message', '')}
+
+⏰ <b>自动下载：</b>
+系统将每{self.x_fav_manager.poll_interval}分钟检查一次并自动下载新增内容
+                    """
+                    await status_msg.edit_text(success_text, parse_mode="HTML")
+                else:
+                    await status_msg.edit_text(f"❌ {result.get('error', '订阅失败')}")
+
+            elif command == "remove":
+                # 取消订阅
+                result = self.x_fav_manager.remove_subscription()
+
+                if result["success"]:
+                    success_text = f"""
+✅ <b>取消订阅成功！</b>
+
+🎯 已取消 X 红心收藏订阅
+                    """
+                    await update.message.reply_text(success_text, parse_mode="HTML")
+                else:
+                    await update.message.reply_text(f"❌ {result.get('error', '取消订阅失败')}")
+
+            elif command == "check":
+                # 手动检查
+                status_msg = await update.message.reply_text("🔄 开始检查 X 红心收藏...")
+
+                result = await self.x_fav_manager.manual_check()
+
+                if result["success"]:
+                    import time
+                    last_check = result.get('last_check', 0)
+                    last_check_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(last_check)) if last_check > 0 else "未检查"
+
+                    success_text = f"""
+✅ <b>检查完成！</b>
+
+🎯 <b>检查结果</b>
+• 已下载总数: {result.get('download_count', 0)}
+• 最后检查: {last_check_str}
+                    """
+                    await status_msg.edit_text(success_text, parse_mode="HTML")
+                else:
+                    await status_msg.edit_text(f"❌ {result.get('error', '检查失败')}")
+
+            else:
+                # 显示帮助
+                await update.message.reply_text("❌ 未知命令，请使用 /xfav 查看帮助")
+
+        except Exception as e:
+            logger.error(f"xfav命令处理失败: {e}")
             await update.message.reply_text(f"❌ 命令处理失败: {e}")
 
     async def handle_qbittorrent_links(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, status_message):
@@ -18885,6 +19071,7 @@ class TelegramBot:
             "• <b>/version</b> - 🔧 查看版本信息\n"
             "• <b>/settings</b> - 🛠 功能设置面板\n"
             "• <b>/favsub</b> - 📚 B站收藏夹订阅管理\n"
+            "• <b>/xfav</b> - 🎯 X 红心收藏订阅管理\n"
             "• <b>/cancel</b> - ❌ 取消当前下载任务\n"
             "• <b>/cleanup</b> - 🧹 清理重复文件\n"
             "• <b>/reboot</b> - 🔄 重启机器人（管理员）\n\n"
@@ -18900,6 +19087,7 @@ class TelegramBot:
             "• 🎵 YouTube音频模式（MP3提取）\n"
             "• 💬 B站弹幕下载\n"
             "• 🔄 B站收藏夹自动订阅更新\n"
+            "• 🎯 X 红心收藏自动订阅更新\n"
             "• 📱 自动压缩大文件适配Telegram\n"
             "• 💾 断点续传和错误重试\n\n"
 
